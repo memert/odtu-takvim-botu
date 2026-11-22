@@ -19,7 +19,7 @@ DERS_PROGRAMI = {
     4: [("09:40", "12:30", "METE 470", "MT-E04")],
 }
 
-# Gece özeti bu saatte gönderilir (bot saat başını ~7 geçe çalışır, GitHub birkaç dk geciktirebilir)
+# Gece özeti bu saatten sonraki ilk çalışmada gönderilir (bot 10 dk'da bir çalışır, GitHub geciktirebilir)
 GECE_OZETI_SAATI = 23
 # Sessiz saatler: bu aralıkta mail/dosya/not/sınav bildirimi gönderilmez, sabah toplu gelir.
 SESSIZ_BASLANGIC = 23
