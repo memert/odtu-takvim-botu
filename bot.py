@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """
-ODTÜ Takvim Botu – v2
+ODTÜ Takvim Botu – v2.2
 
-Her çalışmada (saatte bir):
-  • Telegram'daki buton basışlarını ve komutları işler (gece de).
+Her çalışmada (GitHub Actions, 10 dakikada bir):
+  • Telegram'daki komutları ve cevapları (/ekle_N, /gec_N …) işler (gece de).
   • Gece özeti saatiyse yarının dersleri + yaklaşan sınav/teslimleri gönderir.
   • Sessiz saatler dışındaysa:
       - ODTÜClass: yeni/güncellenen dosyalar, girilen notlar, ödev teslim tarihleri
       - ODTÜ mail: yeni mailler (okulla ilgili olanlar Gemini ile özetlenir, tarih varsa takvim sorusu)
       - MetE midterm/final programı
       - Hepsini tek bir bildirim mesajında toplar; takvim için [Ekle]/[Düzelt] sorar.
-  • Onay olmadan takvime YAZMAZ. Hafızasını durum.json'da tutar
-    (mail içeriği/konusu/göndereni durum.json'a yazılmaz).
+  • ODTÜClass ve sınav programı saatte bir ("tam kontrol"), mail ve Telegram her çalışmada.
+  • Onay olmadan takvime YAZMAZ. Hafızasını şifreli durum.enc'te tutar
+    (mail içeriği/konusu/göndereni hafızaya yazılmaz).
 
 Secrets: ODTU_KULLANICI, ODTU_SIFRE, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-         GOOGLE_SERVICE_ACCOUNT_JSON, GOOGLE_CALENDAR_ID, GEMINI_API_KEY (isteğe bağlı)
+         GOOGLE_SERVICE_ACCOUNT_JSON, GOOGLE_CALENDAR_ID, DURUM_ANAHTARI, GEMINI_API_KEY (isteğe bağlı)
+İsteğe bağlı: BOT_DEBUG=1 → ayrıntılı teşhis satırları (depo herkese açıkken kapalı tutun)
 """
 import os
 import re
@@ -41,6 +43,9 @@ DURUM_DOSYASI = os.environ.get("DURUM_DOSYASI", "durum.enc")   # şifreli hafız
 ESKI_DURUM_DOSYASI = "durum.json"                                 # eski (şifresiz) sürümden geçiş için
 DURUM_ANAHTARI = os.environ.get("DURUM_ANAHTARI", "")
 AGIR_KONTROL_DK = 55   # ODTÜClass + sınav sayfası en fazla bu sıklıkla (dk) kontrol edilir
+GEMINI_TIMEOUT_SN = 45      # tek Gemini isteği için bekleme
+GEMINI_BUTCE_SN = 180       # bir çalışmada Gemini'ye harcanacak toplam süre (iş 10 dk'da kesilmesin)
+DEBUG = os.environ.get("BOT_DEBUG") == "1"
 ODTUCLASS_URL = os.environ.get("ODTUCLASS_URL", ayarlar.ODTUCLASS_URL).rstrip("/")
 IMAP_HOST, IMAP_PORT = "imap.metu.edu.tr", 993
 VARSAYILAN_SURE_DK = 120
@@ -106,6 +111,17 @@ def gizle(metin):
     return metin
 
 
+def log(*a):
+    """Ayrıntılı teşhis satırı; depo herkese açık olduğu için varsayılan kapalı."""
+    if DEBUG:
+        print(*a, flush=True)
+
+
+def hata_izi():
+    """Beklenmeyen hataların izini gizli değerlerden arındırıp günlüğe yazar."""
+    print(gizle(traceback.format_exc()), flush=True)
+
+
 # ------------------------------------------------------------------ HTTP
 def istek(url, method="GET", json_body=None, form=None, headers=None, timeout=30):
     h = {"User-Agent": UA, "Accept": "application/json"}
@@ -145,11 +161,8 @@ def tg(metot, **params):
     return cevap["result"]
 
 
-def mesaj_gonder(metin, butonlar=None):
-    p = {"chat_id": TG_CHAT, "text": metin, "parse_mode": "HTML", "disable_web_page_preview": True}
-    if butonlar:
-        p["reply_markup"] = {"inline_keyboard": [butonlar]}
-    return tg("sendMessage", **p)
+def mesaj_gonder(metin):
+    return tg("sendMessage", chat_id=TG_CHAT, text=metin, parse_mode="HTML", disable_web_page_preview=True)
 
 
 def uzun_mesaj_gonder(metin):
@@ -170,10 +183,6 @@ def mesaj_duzenle(mesaj_id, metin):
            parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         print("Mesaj düzenlenemedi:", gizle(e))
-
-
-def buton(yazi, veri):
-    return {"text": yazi, "callback_data": veri}
 
 
 def komut_menusu_ayarla(durum):
@@ -529,6 +538,23 @@ def odev_ogeleri(odtu, kurslar, simdi):
     return ogeler
 
 
+def hafiza_temizle(durum, kurslar, simdi):
+    """Artık kayıtlı olmadığın derslerin dosya/not kayıtlarını ve tarihi geçmiş 'geçilen'leri siler."""
+    gecerli = {str(k["id"]) for k in kurslar}
+    if gecerli:
+        for alan in ("dosyalar", "notlar"):
+            durum[alan] = {k: v for k, v in durum[alan].items() if k.split(":", 1)[0] in gecerli}
+        for alan in ("dosya_kurslari", "not_kurslari"):
+            durum[alan] = [c for c in durum[alan] if str(c) in gecerli]
+    sinir = simdi - dt.timedelta(days=2)
+    for k, imza in list(durum["gecilenler"].items()):
+        try:
+            if _iso(str(imza).split("|", 1)[0] + "+03:00") < sinir:
+                del durum["gecilenler"][k]
+        except ValueError:
+            pass
+
+
 # ------------------------------------------------------------------ SINAV PROGRAMI
 def sinav_ogeleri(dersler, simdi):
     satirlar, uyarilar = [], []
@@ -614,6 +640,20 @@ class GeminiGecici(RuntimeError):
     pass
 
 
+class GeminiButce(GeminiGecici):
+    """Bu çalışmanın Gemini süresi doldu; maile hiç istek atılmadı (deneme sayılmaz)."""
+
+
+_GEMINI_BASLANGIC = None
+
+
+def _gemini_butce_bitti():
+    global _GEMINI_BASLANGIC
+    if _GEMINI_BASLANGIC is None:
+        _GEMINI_BASLANGIC = time.monotonic()
+    return time.monotonic() - _GEMINI_BASLANGIC > GEMINI_BUTCE_SN
+
+
 def gemini_oku(gonderen, konu, mail_tarihi, govde, dersler, simdi):
     istem = (
         "Bir üniversite öğrencisinin e-posta asistanısın. Aşağıdaki e-postayı oku ve SADECE JSON döndür.\n"
@@ -629,12 +669,17 @@ def gemini_oku(gonderen, konu, mail_tarihi, govde, dersler, simdi):
         f"Gönderen: {gonderen}\nKonu: {konu}\n---\n{govde}")
     govde_json = {"contents": [{"parts": [{"text": istem}]}],
                   "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1}}
-    son_hata = None
+    son_hata, istek_atildi = None, False
     for model in ayarlar.GEMINI_MODELLERI:
         for deneme in range(2):
+            if _gemini_butce_bitti():
+                if istek_atildi:   # bu mail için denendi ve olmadı → deneme hakkından düşsün
+                    raise GeminiGecici("Gemini cevap vermedi, süre doldu")
+                raise GeminiButce("Bu çalışmanın Gemini süresi doldu")
+            istek_atildi = True
             try:
                 r = istek(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                          method="POST", json_body=govde_json, headers={"x-goog-api-key": GEMINI_KEY}, timeout=120)
+                          method="POST", json_body=govde_json, headers={"x-goog-api-key": GEMINI_KEY}, timeout=GEMINI_TIMEOUT_SN)
             except RuntimeError as e:
                 son_hata = e
                 kod = getattr(e, "kod", None)
@@ -710,7 +755,9 @@ def mail_kontrol(durum, dersler, simdi):
 
         def baslik_oku(uid):
             _, parcalar = baglanti.uid("fetch", str(uid), "(RFC822.SIZE BODY.PEEK[HEADER])")
-            meta, bayt = next(((p[0], p[1]) for p in parcalar if isinstance(p, tuple)), (b"", b""))
+            meta, bayt = next(((p[0], p[1]) for p in parcalar or [] if isinstance(p, tuple)), (b"", b""))
+            if not bayt:
+                raise LookupError(f"mail {uid} bulunamadı (silinmiş/taşınmış)")
             boyut = int((re.search(rb"RFC822\.SIZE (\d+)", meta or b"") or [0, 0])[1] or 0)
             b = email.message_from_bytes(bayt or b"", policy=policy.default)
             ad, adres = parseaddr(str(b.get("From", "")))
@@ -719,6 +766,9 @@ def mail_kontrol(durum, dersler, simdi):
         def ai_isle(uid, baslik, boyut, gonderen, konu):
             """(özet satırı ya da None). Geçici hatada uid tekrar listesine girer."""
             nonlocal gemini_hata
+            if _gemini_butce_bitti():
+                tekrar.setdefault(str(uid), 0)   # gövdeyi boşuna indirme; sıraya girsin
+                return None
             govde = ""
             if boyut < 5_000_000:
                 _, tam = baglanti.uid("fetch", str(uid), "(BODY.PEEK[])")
@@ -726,6 +776,9 @@ def mail_kontrol(durum, dersler, simdi):
                 govde = _govde_metni(email.message_from_bytes(ham, policy=policy.default))
             try:
                 ozet, etkinlikler = gemini_oku(gonderen, konu, str(baslik.get("Date", "")), govde, dersler, simdi)
+            except GeminiButce:
+                tekrar.setdefault(str(uid), 0)   # sıraya girer ama deneme hakkı yanmaz
+                return None
             except GeminiGecici:
                 tekrar[str(uid)] = tekrar.get(str(uid), 0) + 1
                 return None
@@ -744,6 +797,8 @@ def mail_kontrol(durum, dersler, simdi):
 
         # a) önceki çalışmalarda Gemini yoğun olduğu için özetlenemeyenler
         for uid_s in list(tekrar)[:5]:
+            if _gemini_butce_bitti():
+                break
             uid = int(uid_s)
             try:
                 baslik, boyut, gonderen, _, konu = baslik_oku(uid)
@@ -764,7 +819,11 @@ def mail_kontrol(durum, dersler, simdi):
         uidler = sorted(u for u in (int(x) for x in (veri[0] or b"").split()) if u > son)
         kalan = max(0, len(uidler) - MAIL_SINIRI)
         for uid in uidler[:MAIL_SINIRI]:
-            baslik, boyut, gonderen, adres, konu = baslik_oku(uid)
+            try:
+                baslik, boyut, gonderen, adres, konu = baslik_oku(uid)
+            except LookupError:
+                m_durum["son_uid"] = uid
+                continue
             satir = f"• <b>{html.escape(gonderen)}</b> – {html.escape(konu)}"
             if okulla_ilgili(adres, konu, dersler) and GEMINI_KEY:
                 sonuc = ai_isle(uid, baslik, boyut, gonderen, konu)
@@ -816,7 +875,7 @@ class Takvim:
     def harita(self, simdi):
         h = {}
         etkinlikler = self.etkinlikler(simdi)
-        print(f"[takvim] 'Sınavlar' takviminde {len(etkinlikler)} etkinlik görüldü")
+        log(f"[takvim] 'Sınavlar' takviminde {len(etkinlikler)} etkinlik görüldü")
         for e in etkinlikler:
             k = ((e.get("extendedProperties") or {}).get("private") or {}).get("botAnahtar")
             if not k:
@@ -836,6 +895,15 @@ class Takvim:
 
 
 # ------------------------------------------------------------------ SORULAR
+def ayni_bilgi_bekliyor(b, o):
+    """Bekleyen soru aynı zamanı söylüyor ve yeni kaynak sadece 'yer'i eksik/aynı veriyorsa True.
+    (Mail ile sınav programı aynı sınav için birbirinin sorusunu ezmesin.)"""
+    if not (b and b.get("oge") and b.get("no")):
+        return False
+    eski = oge_yukle(b["oge"])
+    return eski["baslangic"] == o["baslangic"] and (not o["yer"] or yer_kumesi(o["yer"]) == yer_kumesi(eski["yer"]))
+
+
 def soru_sor(o, e, farklar, durum):
     """Telegram'a [Ekle]/[Düzelt] sorusu gönderir ve bekleyenlere yazar. 'ekle'/'duzelt' döner."""
     k = o["anahtar"]
@@ -870,22 +938,23 @@ def karsilastir_ve_sor(ogeler, harita, durum, simdi, kontrol_edilen):
     for o in ogeler:
         k, imza = o["anahtar"], o["imza"]
         if o["bitis"] < simdi:
-            print(f"[karşılaştır] {k}: tarihi geçmiş")
+            log(f"[karşılaştır] {k}: tarihi geçmiş")
             continue
         e = harita.get(k)
         farklar = farklari_bul(e, o) if e else []
         if e is not None and not farklar:
-            print(f"[karşılaştır] {k}: takvimde var ve doğru")
+            log(f"[karşılaştır] {k}: takvimde var ve doğru")
             durum["gecilenler"].pop(k, None)
             continue
         if durum["gecilenler"].get(k) == imza:
-            print(f"[karşılaştır] {k}: daha önce geçildi/bırakıldı")
+            log(f"[karşılaştır] {k}: daha önce geçildi/bırakıldı")
             continue
-        print(f"[karşılaştır] {k}: " + ("takvimde yok" if e is None else "takvimde farklı") + " → soruluyor")
+        log(f"[karşılaştır] {k}: " + ("takvimde yok" if e is None else "takvimde farklı") + " → soruluyor")
         gerekli.add(k)
         tip = "ekle" if e is None else "duzelt"
         b = durum["bekleyenler"].get(k)
-        if b and b.get("oge") and b.get("no") and b["imza"] == imza and b["tip"] == tip:
+        if b and b.get("oge") and b.get("no") and b["tip"] == tip and (
+                b["imza"] == imza or (b.get("kaynak_tipi") == "mail" and ayni_bilgi_bekliyor(b, o))):
             continue
         if soru_sor(o, e, farklar, durum) == "ekle":
             yeni_ekle.append(k)
@@ -900,22 +969,21 @@ def karsilastir_ve_sor(ogeler, harita, durum, simdi, kontrol_edilen):
 def mail_sorulari(ogeler, harita, durum):
     yeni_ekle = []
     for o in ogeler:
-        e = harita.get(o["anahtar"])
+        k = o["anahtar"]
+        e = harita.get(k)
         farklar = farklari_bul(e, o) if e else []
         if e is not None and not farklar:
             continue
+        if durum["gecilenler"].get(k) == o["imza"]:
+            continue  # aynı bilgiye daha önce "Geç/Bırak" denmiş
+        tip = "ekle" if e is None else "duzelt"
+        b = durum["bekleyenler"].get(k)
+        if b and b.get("oge") and b.get("no") and b["tip"] == tip and (
+                b["imza"] == o["imza"] or ayni_bilgi_bekliyor(b, o)):
+            continue  # aynı (ya da sadece yeri eksik) soru zaten cevap bekliyor
         if soru_sor(o, e, farklar, durum) == "ekle":
             yeni_ekle.append(o["anahtar"])
     return yeni_ekle
-
-
-def eski_butonlu_sorulari_yenile(durum, harita):
-    """v2.0'dan kalan butonlu mail/elle sorularını komutlu olarak yeniden gönderir."""
-    for k, b in list(durum["bekleyenler"].items()):
-        if b.get("oge") and not b.get("no") and b.get("kaynak_tipi") in ("mail", "elle"):
-            o = oge_yukle(b["oge"])
-            e = harita.get(k)
-            soru_sor(o, e, farklari_bul(e, o) if e else [], durum)
 
 
 def eski_mail_sorularini_temizle(durum, simdi):
@@ -943,7 +1011,7 @@ YARDIM = (
     "   ör. <code>/ekle MSE475 MT2 10.12 17:40 U-Z01</code>\n"
     "/yardim – bu mesaj\n\n"
     "Sorulardaki /ekle_12, /gec_12 gibi mavi komutlara dokunarak cevap verirsin.\n"
-    "Bot saatte bir çalışır; cevapların ve komutların bir sonraki çalışmada işlenir.\n"
+    "Bot 10 dakikada bir çalışır; cevapların ve komutların bir sonraki çalışmada işlenir.\n"
     f"{ayarlar.SESSIZ_BASLANGIC:02d}:00–{ayarlar.SESSIZ_BITIS:02d}:00 arası sessiz; gece gelenler sabah toplu gelir."
 )
 
@@ -974,41 +1042,6 @@ def tek_islem(eylem, anahtar, b, takvim, harita, durum):
     del durum["bekleyenler"][anahtar]
     mesaj_duzenle(b["mesaj_id"], oge_basligi(o) + "\n\n" + sonuc)
     return f"{sonuc.split('.')[0]}: {html.escape(o['baslik'])}"
-
-
-def buton_isle(cq, durum, takvim, harita):
-    if str(cq.get("message", {}).get("chat", {}).get("id")) != TG_CHAT:
-        print("[buton] başka sohbetten geldi → yok sayıldı")
-        return
-    try:
-        tg("answerCallbackQuery", callback_query_id=cq["id"])
-    except Exception:
-        pass
-    eylem, _, anahtar = (cq.get("data") or "").partition(":")
-    mesaj_id = cq["message"]["message_id"]
-    if eylem in ("E", "G"):
-        t = durum["toplu"].pop(anahtar, None)
-        if not t:
-            mesaj_duzenle(mesaj_id, "ℹ️ Bu toplu soru artık geçerli değil.")
-            return
-        sayi = 0
-        for k in t["anahtarlar"]:
-            b = durum["bekleyenler"].get(k)
-            if b and b.get("oge") and b["tip"] == "ekle":
-                tek_islem(eylem.lower(), k, b, takvim, harita, durum)
-                sayi += 1
-        mesaj_duzenle(mesaj_id, (f"✅ {sayi} öğe takvime eklendi." if eylem == "E" else f"⏭ {sayi} öğe geçildi.")
-                      + (" (Tek tek cevapladıkların değişmedi.)" if sayi < len(t["anahtarlar"]) else ""))
-        return
-    b = durum["bekleyenler"].get(anahtar)
-    print(f"[buton] {eylem}:{anahtar} mesaj={mesaj_id} → "
-          + ("bekleyenlerde yok" if not b else f"bekleyen mesaj={b.get('mesaj_id')} oge={'var' if b.get('oge') else 'yok'}"))
-    if not b or not b.get("oge") or b.get("mesaj_id") != mesaj_id or eylem not in ("e", "d", "g", "b"):
-        mesaj_duzenle(mesaj_id, "ℹ️ Bu soru artık geçerli değil (yeni bir mesaj gönderilmiş olabilir).")
-        if b and not b.get("oge"):
-            del durum["bekleyenler"][anahtar]  # v1'den kalma soru
-        return
-    tek_islem(eylem, anahtar, b, takvim, harita, durum)
 
 
 def komut_isle(msg, durum, takvim, harita, simdi):
@@ -1077,27 +1110,28 @@ def cevap_komutu(toplu, eylem, no, durum, takvim, harita):
 
 
 def guncellemeleri_isle(durum, takvim, simdi):
-    harita = takvim.harita(simdi)
-    guncellemeler = tg("getUpdates", offset=durum["tg_offset"], timeout=0,
-                       allowed_updates=["message", "callback_query"])
-    print(f"[telegram] offset={durum['tg_offset']} → {len(guncellemeler)} güncelleme; "
-          f"bekleyen sorular: {sorted(durum['bekleyenler'])}")
+    guncellemeler = tg("getUpdates", offset=durum["tg_offset"], timeout=0, allowed_updates=["message"])
+    print(f"[telegram] {len(guncellemeler)} güncelleme")
+    log(f"[telegram] offset={durum['tg_offset']}; bekleyen sorular: {sorted(durum['bekleyenler'])}")
+    if not guncellemeler:
+        return
+    # takvim haritası sadece takvime yazan komutlar için gerekir (/ekle, /ekle_N, /duzelt_N, /hepsini_ekle_N)
+    gerekli = any(re.match(r"^/(hepsini_)?(ekle|duzelt)(_|\s|@|$)",
+                           ((g.get("message") or {}).get("text") or "").strip().lower()) for g in guncellemeler)
+    harita = takvim.harita(simdi) if gerekli else {}
     sonuclar = []
     for g in guncellemeler:
         metin_ = ((g.get("message") or {}).get("text") or "")
-        tur = "callback " + str(g["callback_query"].get("data")) if "callback_query" in g else (
-            "komut " + metin_.split(" ")[0].split("@")[0][:25] if metin_.startswith("/") else "mesaj (metin)")
-        print(f"[telegram] #{g['update_id']} {tur}")
+        tur = "komut " + metin_.split(" ")[0].split("@")[0][:25] if metin_.startswith("/") else "mesaj (metin)"
+        log(f"[telegram] #{g['update_id']} {tur}")
         durum["tg_offset"] = g["update_id"] + 1
         try:
-            if "callback_query" in g:
-                buton_isle(g["callback_query"], durum, takvim, harita)
-            elif "message" in g:
+            if "message" in g:
                 sonuc = komut_isle(g["message"], durum, takvim, harita, simdi)
                 if sonuc:
                     sonuclar.append(sonuc)
         except Exception as e:
-            print(traceback.format_exc())
+            hata_izi()
             mesaj_gonder("⚠️ İşlem sırasında hata: " + html.escape(gizle(e)))
         durum_kaydet(durum)
     if sonuclar:
@@ -1183,6 +1217,17 @@ class _Atla(Exception):
     pass
 
 
+class _TembelTakvim:
+    """Google'a sadece ilk gerçek takvim işleminde bağlanır."""
+    def __init__(self):
+        self._t = None
+
+    def __getattr__(self, ad):
+        if self._t is None:
+            self._t = Takvim()
+        return getattr(self._t, ad)
+
+
 def main():
     _GIZLILER.extend([TG_TOKEN, ODTU_SIFRE, GEMINI_KEY, DURUM_ANAHTARI])
     eksik = [a for a, v in [("TELEGRAM_TOKEN", TG_TOKEN), ("TELEGRAM_CHAT_ID", TG_CHAT),
@@ -1192,6 +1237,8 @@ def main():
     if eksik:
         raise SystemExit("Eksik secret(lar): " + ", ".join(eksik))
 
+    global _GEMINI_BASLANGIC
+    _GEMINI_BASLANGIC = None          # Gemini süre bütçesi her çalışmada sıfırdan
     simdi = dt.datetime.now(TZ)
     sessiz = sessiz_mi(simdi)
     agir = False
@@ -1203,8 +1250,8 @@ def main():
         except Exception as e:
             uyarilar.append("Komut menüsü: " + gizle(e))
 
-        takvim = Takvim()
-        guncellemeleri_isle(durum, takvim, simdi)  # butonlar ve komutlar (gece de)
+        takvim = _TembelTakvim()
+        guncellemeleri_isle(durum, takvim, simdi)  # komutlar ve cevaplar (gece de)
 
         hedef = gece_ozeti_zamani_mi(durum, simdi)
         if hedef:
@@ -1214,7 +1261,7 @@ def main():
             durum["onceki_sessiz"] = True
             print("Sessiz saat: bildirim kontrolleri sabaha bırakıldı.")
             if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
-                mesaj_gonder("🔕 Sessiz saat: butonlar/komutlar işlendi, diğer kontroller sabaha bırakıldı.")
+                mesaj_gonder("🔕 Sessiz saat: komutlar işlendi, diğer kontroller sabaha bırakıldı.")
             return
 
         sabah, durum["onceki_sessiz"] = durum["onceki_sessiz"], False
@@ -1223,8 +1270,7 @@ def main():
         agir = (sabah or os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch" or not son_agir
                 or simdi - _iso(son_agir) >= dt.timedelta(minutes=AGIR_KONTROL_DK))
         print(f"[plan] {'tam kontrol (ODTÜClass + sınav + mail)' if agir else 'hafif kontrol (mail)'}")
-        if agir:
-            durum["son_agir"] = simdi.replace(second=0, microsecond=0).isoformat()
+        agir_hata = False   # sadece ODTÜClass ve sınav programı hataları (mail hatası sayılmaz)
 
         # --- ODTÜClass
         odtu, kurslar = None, durum["kurslar"]
@@ -1244,9 +1290,11 @@ def main():
                 bilgiler.append("🎓 <b>ODTÜClass ders listen değişti</b>\n" + "\n".join(d)
                                 + "\nYeni dönemse <code>ayarlar.py</code>'deki ders programını güncellemeyi unutma.")
             durum["dersler"], durum["kurslar"] = yeni_dersler, kurslar
+            hafiza_temizle(durum, kurslar, simdi)
         except _Atla:
             pass
         except Exception as e:
+            agir_hata = True
             hatalar.append("ODTÜClass: " + gizle(e) + "\n🎓 Yeni dönem başladıysa ayarlar.py'deki "
                            "ODTUCLASS_URL'yi kontrol et.")
         if odtu:
@@ -1258,11 +1306,13 @@ def main():
                         bilgiler.append(f"{'📂' if ad == 'dosya' else '📊'} {ilk} {ad} hafızaya alındı; "
                                         f"bundan sonraki değişiklikler bildirilecek.")
                 except Exception as e:
+                    agir_hata = True
                     hatalar.append(f"ODTÜClass {ad} kontrolü: " + gizle(e))
             try:
                 ogeler += odev_ogeleri(odtu, kurslar, simdi)
                 kontrol_edilen.add("odev")
             except Exception as e:
+                agir_hata = True
                 hatalar.append("ODTÜClass ödevler: " + gizle(e))
 
         # --- Mail
@@ -1288,7 +1338,12 @@ def main():
         except _Atla:
             pass
         except Exception as e:
+            agir_hata = True
             hatalar.append("Sınav programı: " + gizle(e))
+
+        # tam kontrolde ODTÜClass/sınav hatası olmadıysa saat sayacı ilerler; olduysa 10 dk sonra yeniden denenir
+        if agir and not agir_hata:
+            durum["son_agir"] = simdi.replace(second=0, microsecond=0).isoformat()
 
         # --- Tek bildirim mesajı
         parcalar = []
@@ -1303,10 +1358,9 @@ def main():
             baslik = "☀️ <b>Günaydın — gece gelenler</b>" if sabah else "🔔 <b>Yeni bildirimler</b>"
             uzun_mesaj_gonder(baslik + "\n\n" + "\n\n".join(parcalar))
 
-        # --- Takvim soruları
-        harita = takvim.harita(simdi)
+        # --- Takvim soruları (takvim sadece karşılaştırılacak bir şey varsa okunur)
+        harita = takvim.harita(simdi) if (ogeler or mail_ogeleri) else {}
         eski_mail_sorularini_temizle(durum, simdi)
-        eski_butonlu_sorulari_yenile(durum, harita)
         yeni_ekle = karsilastir_ve_sor(sorted(ogeler, key=lambda o: o["baslangic"]), harita, durum, simdi,
                                        kontrol_edilen)
         yeni_ekle += mail_sorulari(mail_ogeleri, harita, durum)
@@ -1321,7 +1375,7 @@ def main():
             mesaj_gonder(f"🔄 Elle çalıştırma tamam · yeni soru: {len(yeni_ekle)} · "
                          f"bekleyen: {len(durum['bekleyenler'])}")
     except Exception as e:
-        print(traceback.format_exc())
+        hata_izi()
         hatalar.append(gizle(f"{type(e).__name__}: {e}"))
     finally:
         hata_metni = "\n".join(hatalar + uyarilar)
