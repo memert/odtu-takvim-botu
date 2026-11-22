@@ -37,6 +37,7 @@ jobs:
           GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           DURUM_ANAHTARI: ${{ secrets.DURUM_ANAHTARI }}
+          BOT_DEBUG: "0"   # sorun ararken "1" yap: günlüğe ayrıntılı teşhis satırları yazılır (herkese açık!)
         run: python bot.py
 
       - name: Durumu kaydet
