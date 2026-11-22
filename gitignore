@@ -1,0 +1,4 @@
+# Şifresiz hafıza dosyası asla depoya girmesin (bot sadece şifreli durum.enc kullanır)
+durum.json
+__pycache__/
+*.pyc
