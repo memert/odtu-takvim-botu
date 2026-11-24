@@ -46,6 +46,11 @@ AGIR_KONTROL_DK = 55   # ODTÜClass + sınav sayfası en fazla bu sıklıkla (dk
 GEMINI_TIMEOUT_SN = 45      # tek Gemini isteği için bekleme
 GEMINI_BUTCE_SN = 180       # bir çalışmada Gemini'ye harcanacak toplam süre (iş 10 dk'da kesilmesin)
 DEBUG = os.environ.get("BOT_DEBUG") == "1"
+# Kim tetikledi? "elle" (Run workflow butonu), "cron" (cron-job.org), "zamanlanmis" (GitHub'ın kendi zamanlayıcısı).
+# Sadece gerçekten elle çalıştırmada "🔄 Elle çalıştırma tamam" mesajı ve zorunlu tam kontrol yapılır.
+BOT_TETIK = os.environ.get("BOT_TETIK") or (
+    "elle" if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch" else "zamanlanmis")
+ELLE_CALISTIRMA = BOT_TETIK == "elle"
 ODTUCLASS_URL = os.environ.get("ODTUCLASS_URL", ayarlar.ODTUCLASS_URL).rstrip("/")
 IMAP_HOST, IMAP_PORT = "imap.metu.edu.tr", 993
 VARSAYILAN_SURE_DK = 120
@@ -1289,14 +1294,14 @@ def main():
         if sessiz:
             durum["onceki_sessiz"] = True
             print("Sessiz saat: bildirim kontrolleri sabaha bırakıldı.")
-            if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+            if ELLE_CALISTIRMA:
                 mesaj_gonder("🔕 Sessiz saat: komutlar işlendi, diğer kontroller sabaha bırakıldı.")
             return
 
         sabah, durum["onceki_sessiz"] = durum["onceki_sessiz"], False
         bolumler, bilgiler, kontrol_edilen, ogeler = {}, [], set(), []
         son_agir = durum.get("son_agir")
-        agir = (sabah or os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch" or not son_agir
+        agir = (sabah or ELLE_CALISTIRMA or not son_agir
                 or simdi - _iso(son_agir) >= dt.timedelta(minutes=AGIR_KONTROL_DK))
         print(f"[plan] {'tam kontrol (ODTÜClass + sınav + mail)' if agir else 'hafif kontrol (mail)'}")
         agir_hata = False   # sadece ODTÜClass ve sınav programı hataları (mail hatası sayılmaz)
@@ -1400,7 +1405,7 @@ def main():
             mesaj_duzenle(durum["toplu"].pop(bid)["mesaj_id"], "ℹ️ Bu sorular cevaplandı.")
 
         print(f"{len(ogeler)} takvim öğesi, {len(mail_ogeleri)} mail öğesi, {len(yeni_ekle)} yeni soru.")
-        if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+        if ELLE_CALISTIRMA:
             mesaj_gonder(f"🔄 Elle çalıştırma tamam · yeni soru: {len(yeni_ekle)} · "
                          f"bekleyen: {len(durum['bekleyenler'])}")
     except Exception as e:
