@@ -1,9 +1,16 @@
 name: Takvim botu
 
 on:
+  # Asıl zamanlayıcı cron-job.org (10 dk'da bir workflow_dispatch + kaynak=cron gönderir).
+  # GitHub'ın kendi zamanlayıcısı düzensiz olduğu için sadece saatlik yedek olarak duruyor.
   schedule:
-    - cron: "*/10 * * * *"  # 10 dakikada bir (GitHub birkaç dakika geciktirebilir)
-  workflow_dispatch:         # Actions sekmesinden "Run workflow" ile elle çalıştırma
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      kaynak:
+        description: "Tetikleyen: elle ya da cron"
+        required: false
+        default: "elle"
 
 permissions:
   contents: write            # şifreli durum.enc'i depoya geri kaydetmek için
@@ -41,6 +48,7 @@ jobs:
           GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           DURUM_ANAHTARI: ${{ secrets.DURUM_ANAHTARI }}
+          BOT_TETIK: ${{ inputs.kaynak || 'zamanlanmis' }}
           BOT_DEBUG: "0"   # sorun ararken "1" yap: günlüğe ayrıntılı teşhis satırları yazılır (herkese açık!)
         run: python bot.py
 
